@@ -450,6 +450,12 @@ static void recv_generator(char *fname, struct file_struct *file, int i,
 		}
 	}
 
+	if (extended_attributes && !strncmp("._", file->basename, 2)) {
+		write_int(f_out,i);
+		write_sum_head(f_out, NULL);
+		return;
+	}
+
 	if (statret == 0 && !S_ISREG(st.st_mode)) {
 		if (delete_file(fname) != 0)
 			return;
@@ -590,7 +596,7 @@ void generate_files(int f_out, struct file_list *flist, char *local_name)
 	int phase = 0;
 	char fbuf[MAXPATHLEN];
 #ifdef HAVE_COPYFILE
-	int ea_map[flist->count];
+	int *ea_map = NULL;
 	int ea_saved = -1;
 #endif
 
@@ -624,7 +630,9 @@ void generate_files(int f_out, struct file_list *flist, char *local_name)
 
 	    if (verbose > 3)
 		rprintf(FINFO,"initializing extended attribute map\n");
-
+	    ea_map = malloc(sizeof(int)*flist->count);
+	    if (!ea_map)
+		    out_of_memory("extended attribute map");
 	    for (i = 0; i < flist->count; ++i) {
 		ea_map[i] = -1;
 		file2 = flist->files[i];
@@ -713,6 +721,10 @@ next:		    file = flist->files[i];
 #endif
 	}
 
+#ifdef HAVE_COPYFILE
+	if (ea_map)
+		free(ea_map);
+#endif
 	phase++;
 	csum_length = SUM_LENGTH;
 	ignore_times = 1;

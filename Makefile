@@ -6,7 +6,7 @@
 Project         = rsync
 UserType        = Administration
 ToolType        = Commands
-GnuAfterInstall = install-plist
+GnuAfterInstall = install-plist populate-symroot
 
 # CFLAGS is set in the Makefile, but overridden in the environment.
 # To work around, just pass the extra flags that the Makefile contains.
@@ -38,8 +38,9 @@ ifeq ($(AEP),YES)
 	$(RMDIR) $(SRCROOT)/$(AEP_Project)
 	$(MV) $(SRCROOT)/$(AEP_ExtractDir) $(SRCROOT)/$(AEP_Project)
 	for patchfile in $(AEP_Patches); do \
-		cd $(SRCROOT)/$(Project) && patch -p0 < $(SRCROOT)/patches/$$patchfile; \
+		cd $(SRCROOT)/$(Project) && patch -p0 < $(SRCROOT)/patches/$$patchfile || exit 1; \
 	done
+	cd $(SRCROOT)/$(Project) && patch -p0 < patches/mkfifo.diff
 endif
 
 OSV = $(DSTROOT)/usr/local/OpenSourceVersions
@@ -50,3 +51,6 @@ install-plist:
 	$(INSTALL_FILE) $(SRCROOT)/$(Project).plist $(OSV)/$(Project).plist
 	$(MKDIR) $(OSL)
 	$(INSTALL_FILE) $(Sources)/COPYING $(OSL)/$(Project).txt
+
+populate-symroot:
+	$(CP) $(OBJROOT)/rsync $(SYMROOT)

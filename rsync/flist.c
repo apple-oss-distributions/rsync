@@ -992,7 +992,7 @@ void send_file_name(int f, struct file_list *flist, char *fname,
 #ifdef HAVE_COPYFILE
 		    if(strncmp(file->basename, "._", 2)
 			&& copyfile(fname, NULL, 0,
-			    COPYFILE_CHECK | COPYFILE_METADATA)) {
+				    COPYFILE_CHECK | COPYFILE_ACL | COPYFILE_XATTR | (preserve_links ? COPYFILE_NOFOLLOW : 0))) {
 			char *bp;
 			struct file_struct *file2 = NULL;
 			int alloc_len;
@@ -1017,6 +1017,7 @@ void send_file_name(int f, struct file_list *flist, char *fname,
 			file2->length = 1;
 			file2->mode = S_IFREG | S_IRUSR;
 			file2->modtime = file->modtime;
+			file2->u.sum = empty_sum;
 
 			flist_expand(flist);
 			flist->files[flist->count++] = file2;
