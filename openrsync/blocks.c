@@ -33,6 +33,9 @@
 #include "md4.h"
 #include "extern.h"
 
+/* I/O failure in blk_find() */
+#define	BLK_IOFAIL	((void *)-1)
+
 struct	blkhash {
 	const struct blk	*blk;
 	TAILQ_ENTRY(blkhash)	 entries;
@@ -168,7 +171,15 @@ blk_find(struct sess *sess, struct blkstat *st,
 	if (!recomp) {
 		fhash = (st->s1 & 0xFFFF) | (st->s2 << 16);
 	} else {
-		fhash = hash_fast(st->map + st->offs, (size_t)osz);
+		if (!fmap_trap(st->map)) {
+			WARNX("%s: file truncated while reading", path);
+			return BLK_IOFAIL;
+		}
+
+		fhash = hash_fast(fmap_data(st->map, st->offs, (size_t)osz),
+		    (size_t)osz);
+		fmap_untrap(st->map);
+
 		st->s1 = fhash & 0xFFFF;
 		st->s2 = fhash >> 16;
 	}
@@ -181,7 +192,14 @@ blk_find(struct sess *sess, struct blkstat *st,
 	if (st->hint < blks->blksz &&
 	    fhash == blks->blks[st->hint].chksum_short &&
 	    (size_t)osz == blks->blks[st->hint].len) {
-		hash_slow(st->map + st->offs, (size_t)osz, md, sess);
+		if (!fmap_trap(st->map)) {
+			WARNX("%s: file truncated while reading", path);
+			return BLK_IOFAIL;
+		}
+		hash_slow(fmap_data(st->map, st->offs, (size_t)osz),
+		    (size_t)osz, md, sess);
+		fmap_untrap(st->map);
+
 		have_md = 1;
 		if (memcmp(md, blks->blks[st->hint].chksum_long, blks->csum) == 0) {
 			LOG4("%s: found matching hinted match: "
@@ -214,7 +232,14 @@ blk_find(struct sess *sess, struct blkstat *st,
 		    (intmax_t)ent->blk->offs, ent->blk->len);
 
 		if (have_md == 0) {
-			hash_slow(st->map + st->offs, (size_t)osz, md, sess);
+			if (!fmap_trap(st->map)) {
+				WARNX("%s: file truncated while reading", path);
+				return BLK_IOFAIL;
+			}
+			hash_slow(fmap_data(st->map, st->offs, (size_t)osz),
+			    (size_t)osz, md, sess);
+			fmap_untrap(st->map);
+
 			have_md = 1;
 		}
 
@@ -232,7 +257,13 @@ blk_find(struct sess *sess, struct blkstat *st,
 	 * block in the sequence.
 	 */
 
-	map = st->map + st->offs;
+	if (!fmap_trap(st->map)) {
+		WARNX("%s: file truncated while reading", path);
+		return BLK_IOFAIL;
+	}
+
+	map = fmap_data(st->map, st->offs, osz + (osz >= remain ? 0 : 1));
+
 	st->s1 -= map[0];
 	st->s2 -= osz * map[0];
 
@@ -240,6 +271,7 @@ blk_find(struct sess *sess, struct blkstat *st,
 		st->s1 += map[osz];
 		st->s2 += st->s1;
 	}
+	fmap_untrap(st->map);
 
 	return NULL;
 }
@@ -250,7 +282,7 @@ blk_find(struct sess *sess, struct blkstat *st,
  * This function is reentrant: it must be called while there's still
  * data to send.
  */
-void
+int
 blk_match(struct sess *sess, const struct blkset *blks,
 	const char *path, struct blkstat *st)
 {
@@ -287,8 +319,11 @@ blk_match(struct sess *sess, const struct blkset *blks,
 
 		for (i = 0; st->offs < end; st->offs++, i++) {
 			blk = blk_find(sess, st, blks, path, i == 0);
-			if (blk == NULL)
+			if (blk == NULL) {
 				continue;
+			} else if (blk == BLK_IOFAIL) {
+				return 0;
+			}
 
 			sz = st->offs - last;
 			st->dirty += sz;
@@ -313,7 +348,7 @@ blk_match(struct sess *sess, const struct blkset *blks,
 			sess->total_matched += blk->len;
 			st->offs += blk->len;
 			st->hint = blk->idx + 1;
-			return;
+			return 1;
 		}
 
 		/* Emit remaining data and send terminator token. */
@@ -341,6 +376,8 @@ blk_match(struct sess *sess, const struct blkset *blks,
 		LOG4("%s: flushing whole file %zu B",
 		    path, st->mapsz);
 	}
+
+	return 1;
 }
 
 /*
@@ -417,8 +454,14 @@ blk_recv(struct sess *sess, int fd, struct iobuf *buf, const char *path,
 	 * in reading the individual blocks for this file.
 	 */
 	if (meta) {
-		if (iobuf_get_readsz(buf) < (4 * sizeof(int32_t)))
+		if (iobuf_get_readsz(buf) < (4 * sizeof(int32_t))) {
+			if (iobuf_seen_eof(buf)) {
+				ERR("hangup awaiting block prologue");
+				goto out;
+			}
+
 			return s;
+		}
 
 		if (!iobuf_read_size(buf, &s->blksz)) {
 			ERRX1("iobuf_read_size");
@@ -470,8 +513,14 @@ blk_recv(struct sess *sess, int fd, struct iobuf *buf, const char *path,
 	 */
 
 	for (j = *blkidx; j < s->blksz; j++) {
-		if (iobuf_get_readsz(buf) < sizeof(int32_t) + s->csum)
+		if (iobuf_get_readsz(buf) < sizeof(int32_t) + s->csum) {
+			if (iobuf_seen_eof(buf)) {
+				ERR("hangup awaiting block information");
+				goto out;
+			}
+
 			break;
+		}
 
 		b = &s->blks[j];
 		iobuf_read_int(buf, &i);

@@ -1,5 +1,6 @@
 /*
  * Copyright (c) 2019 Kristaps Dzonsons <kristaps@bsd.lv>
+ * Copyright (c) 2024, Klara, Inc.
  *
  * Permission to use, copy, modify, and distribute this software for any
  * purpose with or without fee is hereby granted, provided that the above
@@ -16,6 +17,7 @@
 #include "config.h"
 
 #include <sys/mman.h>
+#include <sys/param.h>
 #if HAVE_SYS_QUEUE
 # include <sys/queue.h>
 #endif
@@ -90,10 +92,9 @@ send_up_reset(struct send_up *p)
 
 	/* If we mapped a file for scanning, unmap it and close. */
 
-	if (p->stat.map != MAP_FAILED)
-		munmap(p->stat.map, p->stat.mapsz);
-
-	p->stat.map = MAP_FAILED;
+	if (p->stat.map != NULL)
+		fmap_close(p->stat.map);
+	p->stat.map = NULL;
 	p->stat.mapsz = 0;
 
 	if (p->stat.fd != -1)
@@ -106,6 +107,7 @@ send_up_reset(struct send_up *p)
 	p->stat.offs = 0;
 	p->stat.hint = 0;
 	p->stat.curst = BLKSTAT_NONE;
+	p->stat.error = false;
 }
 
 /* Returns 1 on success, 0 on error */
@@ -137,13 +139,63 @@ compress_reinit(struct sess *sess)
 
 	return 1;
 }
+
+static int
+sender_terminate_file_data(struct sess *sess, size_t padsz, void **wb,
+	size_t pos, size_t *wbsz, size_t *wbmax)
+{
+	char zerobuf[1024] = { 0 };
+	bool need_alloc;
+
+	need_alloc = false;
+
+	while (padsz != 0) {
+		size_t chunksz;
+
+		/*
+		 * The caller has allocated enough for one frame + data
+		 * buffer, but if our block size exceeds the size of zerobuf
+		 * then we need multiple frames to cover it.  Thus, we need an
+		 * allocation for any subsequent write to the buffer to handle
+		 * multiplexing correctly.
+		 */
+		if (need_alloc && !io_lowbuffer_alloc(sess, wb, wbsz, wbmax,
+		    0)) {
+			ERRX("io_lowbuffer_alloc");
+			return 0;
+		}
+
+		chunksz = MIN(padsz, sizeof(zerobuf));
+		io_lowbuffer_buf(sess, *wb, &pos, *wbsz, zerobuf, chunksz);
+
+		need_alloc = true;
+		padsz -= chunksz;
+	}
+
+	return 1;
+}
+
+static void
+sender_terminate_file(struct sess *sess, struct send_up *up)
+{
+
+	up->stat.error = true;
+	if (sess->opts->compress) {
+		up->stat.curst = BLKSTAT_FLUSH;
+	} else {
+		up->stat.curst = BLKSTAT_TOK;
+		up->stat.curtok = 0;
+	}
+}
+
 /*
  * Fast forward through part of the file the other side already
  * has while keeping compression state intact.
  * Returns 1 on success, 0 on error.
  */
 static int
-token_ff_compressed(struct sess *sess, struct send_up *up, size_t tok)
+token_ff_compressed(struct sess *sess, struct send_up *up, size_t tok,
+	struct flist *fl)
 {
 	char		*buf = NULL, *cbuf = NULL;
 	size_t		 sz, clen, rlen;
@@ -158,18 +210,37 @@ token_ff_compressed(struct sess *sess, struct send_up *up, size_t tok)
 	sz = (tok == up->cur->blks->blksz - 1 && up->cur->blks->rem) ?
 	    up->cur->blks->rem : up->cur->blks->len;
 	assert(sz);
-	assert(up->stat.map != MAP_FAILED);
-	off = tok * up->cur->blks->len;
-	buf = up->stat.map + off;
+	assert(up->stat.map != NULL);
 
-	cbuf = malloc(MAX_CHUNK_BUF);
-	if (cbuf == NULL) {
-		ERRX1("malloc");
+	off = up->stat.curpos;
+	assert(sz == up->cur->blks->len || sz == up->stat.mapsz - off);
+
+	if (!fmap_trap(up->stat.map)) {
+		sess->total_errors++;
+		sender_terminate_file(sess, up);
+		WARNX("%s: file truncated while reading",
+		    fl[up->cur->idx].path);
 		return 0;
 	}
+	buf = fmap_data(up->stat.map, off, sz);
+
+	cbuf = sess->token_cbuf;
+	if (sess->token_cbufsz < MAX_CHUNK_BUF) {
+		cbuf = malloc(MAX_CHUNK_BUF);
+		if (cbuf == NULL) {
+			ERRX1("malloc");
+			fmap_untrap(up->stat.map);
+			return 0;
+		}
+
+		free(sess->token_cbuf);
+		sess->token_cbuf = cbuf;
+		sess->token_cbufsz = MAX_CHUNK_BUF;
+	}
+
 	if (!compress_reinit(sess)) {
-		ERRX1("decompress_reinit");
-		free(cbuf);
+		ERRX1("compress_reinit");
+		fmap_untrap(up->stat.map);
 		return 0;
 	}
 
@@ -188,13 +259,14 @@ token_ff_compressed(struct sess *sess, struct send_up *up, size_t tok)
 		cctx.avail_out = TOKEN_MAX_DATA;
 		res = deflate(&cctx, Z_INSERT_ONLY);
 		if (res != Z_OK || cctx.avail_in != 0) {
+			fmap_untrap(up->stat.map);
 			ERRX("deflate ff res=%d", res);
-			free(cbuf);
 			return 0;
 		}
 		buf += clen;
 	}
-	free(cbuf);
+
+	fmap_untrap(up->stat.map);
 
 	return 1;
 }
@@ -208,13 +280,13 @@ send_up_fsm_compressed(struct sess *sess, size_t *phase,
 	struct send_up *up, void **wb, size_t *wbsz, size_t *wbmax,
 	struct flist *fl)
 {
-	size_t		 pos = 0, isz = sizeof(int32_t),
+	size_t		 pos = *wbsz, isz = sizeof(int32_t),
 			 dsz = MD4_DIGEST_LENGTH;
 	unsigned char	 fmd[MD4_DIGEST_LENGTH];
 	off_t		 sz, ssz;
 	char		 buf[16];
 	char		*sbuf = NULL, *cbuf = NULL;
-	int		 res;
+	int		 res, flush = Z_NO_FLUSH;
 
 	switch (up->stat.curst) {
 	case BLKSTAT_DATA:
@@ -226,17 +298,34 @@ send_up_fsm_compressed(struct sess *sess, size_t *phase,
 		 */
 
 		sz = MINIMUM(MAX_CHUNK,
-			up->stat.mapsz - up->stat.curpos);
-		sbuf = up->stat.map + up->stat.curpos;
-		cbuf = malloc(TOKEN_MAX_BUF);
-		if (cbuf == NULL) {
-			ERRX1("malloc");
-			return 0;
+			up->stat.curlen - up->stat.curpos);
+
+		if (!fmap_trap(up->stat.map)) {
+			sess->total_errors++;
+			sender_terminate_file(sess, up);
+			WARNX("%s: file truncated while reading",
+			    fl[up->cur->idx].path);
+			return 1;
+		}
+		sbuf = fmap_data(up->stat.map, up->stat.curpos, sz);
+
+		cbuf = sess->token_cbuf;
+		if (sess->token_cbufsz < TOKEN_MAX_BUF) {
+			cbuf = malloc(TOKEN_MAX_BUF);
+			if (cbuf == NULL) {
+				ERRX1("malloc");
+				fmap_untrap(up->stat.map);
+				return 0;
+			}
+
+			free(sess->token_cbuf);
+			sess->token_cbuf = cbuf;
+			sess->token_cbufsz = TOKEN_MAX_BUF;
 		}
 
 		if (!compress_reinit(sess)) {
-			ERRX1("decompress_reinit");
-			free(cbuf);
+			ERRX1("compress_reinit");
+			fmap_untrap(up->stat.map);
 			return 0;
 		}
 
@@ -246,14 +335,21 @@ send_up_fsm_compressed(struct sess *sess, size_t *phase,
 		cctx.next_out = (Bytef *)(cbuf + 2);
 		cctx.avail_out = TOKEN_MAX_DATA;
 
-		while ((res = deflate(&cctx, Z_NO_FLUSH)) == Z_OK) {
+		if ((up->stat.curpos + sz) == up->stat.curlen) {
+			flush = Z_SYNC_FLUSH;
+		}
+		while ((res = deflate(&cctx, flush)) == Z_OK) {
 			ssz = TOKEN_MAX_DATA - cctx.avail_out;
+			if (flush != Z_NO_FLUSH) {
+				assert(ssz >= 4);
+				ssz -= 4;
+			}
 			if (ssz == 0) {
 				break;
 			}
 			if (!io_lowbuffer_alloc(sess, wb, wbsz, wbmax, ssz + 2)) {
+				fmap_untrap(up->stat.map);
 				ERRX("io_lowbuffer_alloc");
-				free(cbuf);
 				return 0;
 			}
 			cbuf[0] = (TOKEN_DEFLATED + (ssz >> 8)) & 0xff;
@@ -266,17 +362,23 @@ send_up_fsm_compressed(struct sess *sess, size_t *phase,
 				cctx.next_out = (Bytef *)(cbuf + 2);
 				/* Save room for the 4 byte trailer */
 				cctx.avail_out = TOKEN_MAX_DATA;
+				if (flush != Z_NO_FLUSH) {
+					memcpy(cctx.next_out, cbuf+TOKEN_MAX_DATA-2, 4);
+					cctx.next_out += 4;
+					cctx.avail_out -= 4;
+				}
 			}
 		}
+		fmap_untrap(up->stat.map);
 		if (res != Z_OK && res != Z_BUF_ERROR) {
 			ERRX("deflate res=%d", res);
-			free(cbuf);
 			return 0;
 		}
-		free(cbuf);
 		up->stat.curpos += sz;
 		if (up->stat.curpos == up->stat.mapsz) {
 			up->stat.curst = BLKSTAT_FLUSH;
+		} else if (up->stat.curpos == up->stat.curlen) {
+			up->stat.curst = BLKSTAT_TOK;
 		}
 		return 1;
 	case BLKSTAT_TOK:
@@ -292,7 +394,19 @@ send_up_fsm_compressed(struct sess *sess, size_t *phase,
 			BLKSTAT_NEXT : BLKSTAT_FLUSH;
 
 		if (up->stat.curtok == 0) {
-			/* Empty files don't need handling */
+			/* Empty files just need an END token */
+			if (!compress_reinit(sess)) {
+				ERRX1("compress_reinit");
+				return 0;
+			}
+
+			if (!io_lowbuffer_alloc(sess, wb, wbsz, wbmax, 1)) {
+				ERRX1("io_lowbuffer_alloc");
+				return 0;
+			}
+			io_lowbuffer_byte(sess, *wb, &pos, *wbsz, TOKEN_END);
+			comp_state = COMPRESS_DONE;
+			up->stat.curst = BLKSTAT_HASH;
 			return 1;
 		}
 
@@ -309,7 +423,7 @@ send_up_fsm_compressed(struct sess *sess, size_t *phase,
 		io_lowbuffer_int(sess, *wb,
 			&pos, *wbsz, -(up->stat.curtok + 1));
 
-		token_ff_compressed(sess, up, -(up->stat.curtok + 1));
+		token_ff_compressed(sess, up, -(up->stat.curtok + 1), fl);
 		return 1;
 	case BLKSTAT_HASH:
 		/*
@@ -318,7 +432,26 @@ send_up_fsm_compressed(struct sess *sess, size_t *phase,
 		 * finished with the file.
 		 */
 
-		hash_file(up->stat.map, up->stat.mapsz, fmd, sess);
+		if (!up->stat.error &&
+		    hash_fmap(fl[up->cur->idx].path, up->stat.map,
+		    up->stat.mapsz, fmd, sess) != 0) {
+			ERRX1("hash_fmap");
+			sess->total_errors++;
+			up->stat.error = true;
+		}
+
+		if (up->stat.error) {
+			/*
+			 * At some point the file got truncated, so we pass off
+			 * a bogus hash to force a redo.  XXX This would be
+			 * cleaner if we kept a running hash as the transfer
+			 * progressed, as we just finalize it and +1 for a more
+			 * certain mismatch.
+			 */
+			memset(fmd, 0, dsz);
+			fmd[0]++;
+		}
+
 		if (!io_lowbuffer_alloc(sess, wb, wbsz, wbmax, dsz)) {
 			ERRX1("io_lowbuffer_alloc");
 			return 0;
@@ -331,48 +464,57 @@ send_up_fsm_compressed(struct sess *sess, size_t *phase,
 		 * Flush the end of the compressed stream.
 		 */
 
-		cbuf = malloc(TOKEN_MAX_BUF);
-		if (cbuf == NULL) {
-			ERRX1("malloc");
-			return 0;
-		}
-		cctx.avail_in = 0;
-		cctx.next_in = NULL;
-		cctx.next_out = (Bytef *)(cbuf + 2);
-		cctx.avail_out = TOKEN_MAX_DATA;
-
-		while ((res = deflate(&cctx, Z_SYNC_FLUSH)) == Z_OK) {
-			ssz = TOKEN_MAX_DATA - cctx.avail_out;
-			assert(ssz >= 4);
-			ssz -= 4; /* Trim off the trailer bytes */
-			if (ssz != 0 && res != Z_BUF_ERROR) {
-				if (!io_lowbuffer_alloc(sess, wb, wbsz, wbmax, ssz + 2)) {
-					ERRX("io_lowbuffer_alloc");
-					free(cbuf);
+		if (!up->stat.error) {
+			cbuf = sess->token_cbuf;
+			if (sess->token_cbufsz < TOKEN_MAX_BUF) {
+				cbuf = malloc(TOKEN_MAX_BUF);
+				if (cbuf == NULL) {
+					ERRX1("malloc");
 					return 0;
 				}
-				cbuf[0] = (TOKEN_DEFLATED + (ssz >> 8)) & 0xff;
-				cbuf[1] = ssz & 0xff;
-				io_lowbuffer_buf(sess, *wb, &pos, *wbsz, cbuf, ssz + 2);
+
+				free(sess->token_cbuf);
+				sess->token_cbuf = cbuf;
+				sess->token_cbufsz = TOKEN_MAX_BUF;
 			}
+
+			cctx.avail_in = 0;
+			cctx.next_in = NULL;
 			cctx.next_out = (Bytef *)(cbuf + 2);
 			cctx.avail_out = TOKEN_MAX_DATA;
-			memcpy(cctx.next_out, cbuf+TOKEN_MAX_DATA-2, 4);
-			cctx.next_out += 4;
-			cctx.avail_out -= 4;
-		}
-		if (res != Z_OK && res != Z_BUF_ERROR) {
-			LOG2("final deflate() res=%d", res);
+
+			while ((res = deflate(&cctx, Z_SYNC_FLUSH)) == Z_OK) {
+				ssz = TOKEN_MAX_DATA - cctx.avail_out;
+				assert(ssz >= 4);
+				ssz -= 4; /* Trim off the trailer bytes */
+				if (ssz != 0 && res != Z_BUF_ERROR) {
+					if (!io_lowbuffer_alloc(sess, wb, wbsz,
+					    wbmax, ssz + 2)) {
+						ERRX("io_lowbuffer_alloc");
+						return 0;
+					}
+					cbuf[0] = (TOKEN_DEFLATED + (ssz >> 8)) & 0xff;
+					cbuf[1] = ssz & 0xff;
+					io_lowbuffer_buf(sess, *wb, &pos, *wbsz,
+					    cbuf, ssz + 2);
+				}
+				cctx.next_out = (Bytef *)(cbuf + 2);
+				cctx.avail_out = TOKEN_MAX_DATA;
+				memcpy(cctx.next_out, cbuf+TOKEN_MAX_DATA-2, 4);
+				cctx.next_out += 4;
+				cctx.avail_out -= 4;
+			}
+			if (res != Z_OK && res != Z_BUF_ERROR) {
+				LOG2("final deflate() res=%d", res);
+			}
 		}
 
 		/* Send the end of token marker */
 		if (!io_lowbuffer_alloc(sess, wb, wbsz, wbmax, 1)) {
 			ERRX("io_lowbuffer_alloc");
-			free(cbuf);
 			return 0;
 		}
-		io_lowbuffer_byte(sess, *wb, &pos, *wbsz, 0);
-		free(cbuf);
+		io_lowbuffer_byte(sess, *wb, &pos, *wbsz, TOKEN_END);
 		comp_state = COMPRESS_DONE;
 		up->stat.curst = BLKSTAT_HASH;
 		return 1;
@@ -388,6 +530,11 @@ send_up_fsm_compressed(struct sess *sess, size_t *phase,
 			    fl[up->cur->idx].path,
 			    (intmax_t)up->stat.total / 1024,
 			    100.0 * up->stat.dirty / up->stat.total);
+		sess->total_files_xfer++;
+		sess->total_xfer_size += fl[up->cur->idx].st.size;
+
+		if (sess->lateprint)
+			log_item(sess, &fl[up->cur->idx]);
 
 		send_up_reset(up);
 		return 1;
@@ -413,8 +560,12 @@ send_up_fsm_compressed(struct sess *sess, size_t *phase,
 		 */
 
 		assert(up->stat.fd != -1);
-		blk_match(sess, up->cur->blks,
-			fl[up->cur->idx].path, &up->stat);
+		if (!blk_match(sess, up->cur->blks,
+		    fl[up->cur->idx].path, &up->stat)) {
+			sess->total_errors++;
+			sender_terminate_file(sess, up);
+		}
+
 		return 1;
 	case BLKSTAT_NONE:
 		break;
@@ -437,22 +588,10 @@ send_up_fsm_compressed(struct sess *sess, size_t *phase,
 		io_lowbuffer_int(sess, *wb, &pos, *wbsz, -1);
 		up->stat.curst = BLKSTAT_PHASE;
 	} else if (sess->opts->dry_run) {
-		if (!sess->opts->server)
-			LOG1("%s", fl[up->cur->idx].wpath);
-
 		send_iflags(sess, wb, wbsz, wbmax, &pos, fl, up->cur->idx);
 		up->stat.curst = BLKSTAT_DONE;
 	} else {
 		assert(up->stat.fd != -1);
-
-		/*
-		 * FIXME: use the nice output of log_file() and so on in
-		 * downloader.c, which means moving this into
-		 * BLKSTAT_DONE instead of having it be here.
-		 */
-
-		if (!sess->opts->server)
-			LOG1("%s", fl[up->cur->idx].wpath);
 
 		send_iflags(sess, wb, wbsz, wbmax, &pos, fl, up->cur->idx);
 
@@ -485,8 +624,8 @@ send_up_fsm(struct sess *sess, size_t *phase,
 	struct send_up *up, void **wb, size_t *wbsz, size_t *wbmax,
 	struct flist *fl)
 {
-	size_t		 pos = 0, isz = sizeof(int32_t),
-			 dsz = MD4_DIGEST_LENGTH;
+	size_t		 pos = *wbsz, isz = sizeof(int32_t),
+			 dsz = MD4_DIGEST_LENGTH, dpos;
 	unsigned char	 fmd[MD4_DIGEST_LENGTH];
 	off_t		 sz;
 	char		 buf[16];
@@ -511,8 +650,25 @@ send_up_fsm(struct sess *sess, size_t *phase,
 			ERRX1("io_lowbuffer_alloc");
 			return 0;
 		}
+
+		dpos = pos;
+		if (!fmap_trap(up->stat.map)) {
+			sess->total_errors++;
+			if (!sender_terminate_file_data(sess, sz, wb, dpos,
+			    wbsz, wbmax)) {
+				/* Allocation error, fatal */
+				return 0;
+			}
+
+			sender_terminate_file(sess, up);
+			WARNX("%s: file truncated while reading",
+			    fl[up->cur->idx].path);
+			return 1;
+		}
+
 		io_lowbuffer_buf(sess, *wb, &pos, *wbsz,
-			up->stat.map + up->stat.curpos, sz);
+			fmap_data(up->stat.map, up->stat.curpos, sz), sz);
+		fmap_untrap(up->stat.map);
 
 		up->stat.curpos += sz;
 		if (up->stat.curpos == up->stat.curlen)
@@ -542,8 +698,26 @@ send_up_fsm(struct sess *sess, size_t *phase,
 		 * This is always followed by the state that we're
 		 * finished with the file.
 		 */
+		if (!up->stat.error &&
+		    hash_fmap(fl[up->cur->idx].path, up->stat.map,
+		    up->stat.mapsz, fmd, sess) != 0) {
+			ERRX1("hash_fmap");
+			sess->total_errors++;
+			up->stat.error = true;
+		}
 
-		hash_file(up->stat.map, up->stat.mapsz, fmd, sess);
+		if (up->stat.error) {
+			/*
+			 * At some point the file got truncated, so we pass off
+			 * a bogus hash to force a redo.  XXX This would be
+			 * cleaner if we kept a running hash as the transfer
+			 * progressed, as we just finalize it and +1 for a more
+			 * certain mismatch.
+			 */
+			memset(fmd, 0, dsz);
+			fmd[0]++;
+		}
+
 		if (!io_lowbuffer_alloc(sess, wb, wbsz, wbmax, dsz)) {
 			ERRX1("io_lowbuffer_alloc");
 			return 0;
@@ -568,6 +742,10 @@ send_up_fsm(struct sess *sess, size_t *phase,
 			    100.0 * up->stat.dirty / up->stat.total);
 		sess->total_files_xfer++;
 		sess->total_xfer_size += fl[up->cur->idx].st.size;
+
+		if (sess->lateprint)
+			log_item(sess, &fl[up->cur->idx]);
+
 		send_up_reset(up);
 		return 1;
 	case BLKSTAT_PHASE:
@@ -591,8 +769,11 @@ send_up_fsm(struct sess *sess, size_t *phase,
 		 */
 
 		assert(up->stat.fd != -1);
-		blk_match(sess, up->cur->blks,
-			fl[up->cur->idx].path, &up->stat);
+		if (!blk_match(sess, up->cur->blks,
+		    fl[up->cur->idx].path, &up->stat)) {
+			sess->total_errors++;
+			sender_terminate_file(sess, up);
+		}
 		return 1;
 	case BLKSTAT_NONE:
 		break;
@@ -615,23 +796,10 @@ send_up_fsm(struct sess *sess, size_t *phase,
 		io_lowbuffer_int(sess, *wb, &pos, *wbsz, -1);
 		up->stat.curst = BLKSTAT_PHASE;
 	} else if (sess->opts->dry_run == DRY_FULL) {
-		if (!sess->opts->server)
-			LOG1("%s", fl[up->cur->idx].wpath);
-
 		send_iflags(sess, wb, wbsz, wbmax, &pos, fl, up->cur->idx);
 		up->stat.curst = BLKSTAT_DONE;
 	} else {
 		assert(up->stat.fd != -1);
-
-		/*
-		 * FIXME: use the nice output of log_file() and so on in
-		 * downloader.c, which means moving this into
-		 * BLKSTAT_DONE instead of having it be here.
-		 */
-
-		if (!sess->opts->server && verbose > 0 &&
-		    !sess->lateprint && !sess->itemize)
-			print_7_or_8_bit(sess, "%s\n", fl[up->cur->idx].wpath);
 
 		send_iflags(sess, wb, wbsz, wbmax, &pos, fl, up->cur->idx);
 
@@ -664,8 +832,14 @@ sender_get_iflags(struct iobuf *buf, struct flist *fl, struct send_dl *sdl)
 	if ((fl->iflags & IFLAG_BASIS_FOLLOWS) != 0) {
 		uint8_t basis;
 
-		if (iobuf_get_readsz(buf) < sizeof(uint8_t))
+		if (iobuf_get_readsz(buf) < sizeof(uint8_t)) {
+			if (iobuf_seen_eof(buf)) {
+				ERR("hangup while awaiting iflags");
+				return -1;
+			}
+
 			return 0;
+		}
 
 		iobuf_read_byte(buf, &basis);
 
@@ -730,7 +904,7 @@ send_iflags(struct sess *sess, void **wb, size_t *wbsz, size_t *wbmax,
 		    fl[idx].basis);
 	}
 	if (IFLAG_HLINK_FOLLOWS & fl[idx].iflags) {
-		linklen = strlen(fl[idx].link);
+		linklen = (fl[idx].link != NULL) ? strlen(fl[idx].link) : 0;
 		if (!io_lowbuffer_alloc(sess, wb, wbsz, wbmax,
 		    linklen + (linklen > 0x7f ? 2 : 1))) {
 			ERRX1("io_lowbuffer_alloc");
@@ -760,7 +934,7 @@ send_dl_enqueue(struct sess *sess, struct send_dlq *q,
     struct send_dl **mdl)
 {
 	struct send_dl	*s;
-	uint32_t	 iflags;
+	int32_t		 iflags;
 
 	/* End-of-phase marker. */
 	if (idx == -1) {
@@ -774,24 +948,37 @@ send_dl_enqueue(struct sess *sess, struct send_dlq *q,
 		TAILQ_INSERT_TAIL(q, s, entries);
 		*mdl = NULL;
 		return 1;
-	} else if (idx < 0 || (uint32_t)idx >= flsz) {
+	} else if (idx < 0 || (uint32_t)idx > flsz) {
 		ERRX("file index out of bounds: invalid %d out of %zu",
 		    idx, flsz);
 		return 0;
 	}
 
 	if (!protocol_itemize)
-		fl[idx].iflags = IFLAG_TRANSFER;
+		iflags = IFLAG_TRANSFER | IFLAG_MISSING_DATA;
 	else
-		iobuf_read_short(buf, &fl[idx].iflags);
+		iobuf_read_short(buf, &iflags);
 
-	iflags = fl[idx].iflags;
 
 	/* Validate the index. */
 	if (iflags == IFLAG_NEW) {
-		/* Keep alive packet, do nothing */
-		return 1;
-	} else if ((iflags & IFLAG_TRANSFER) == 0) {
+		if ((uint32_t)idx == flsz) {
+			/* Keep alive packet, do nothing */
+			return 1;
+		}
+
+		ERRX("invalid index %d of %zu for keep alive packet",
+		     idx, flsz);
+		return 0;
+	} else if ((uint32_t)idx == flsz) {
+		ERRX("invalid item flags 0x%x for index %d of %zu",
+		     iflags, idx, flsz);
+		return 0;
+	}
+
+	fl[idx].iflags = iflags;
+
+	if ((iflags & IFLAG_TRANSFER) == 0) {
 		/* We can't return early due to the state machine */
 	} else if (S_ISDIR(fl[idx].st.mode)) {
 		ERRX("blocks requested for "
@@ -913,8 +1100,15 @@ sender_finalize(struct sess *sess, const struct fl *fl, struct iobuf *rbuf,
 		while (state != DONE) {
 			while (iobuf_get_readsz(rbuf) < needed) {
 				if (!iobuf_fill(sess, rbuf, fdin)) {
-					ERRX1("iobuf_fill on final goodbye");
-					break;
+					/*
+					 * iobuf_fill() will only error out if
+					 * we didn't read anything, so we can
+					 * safely bail out here knowing that
+					 * our request won't be satisified.
+					 */
+					ERRX1("iobuf_fill on final goodbye in state %d",
+					    state);
+					return ERR_PROTOCOL;
 				}
 			}
 
@@ -968,6 +1162,17 @@ sender_finalize(struct sess *sess, const struct fl *fl, struct iobuf *rbuf,
 	return 0;
 }
 
+static int
+file_deleted(void *cookie, const void *data, size_t datasz)
+{
+	struct success_ctx *sctx = cookie;
+
+	if (sctx->sess->itemize)
+		LOG0("*deleting %.*s\n", (int)datasz, (const char *)data);
+
+	return 1;
+}
+
 struct fl *flg = NULL;
 
 /*
@@ -1002,6 +1207,7 @@ rsync_sender(struct sess *sess, int fdin,
 	ssize_t		    ssz;
 	int		    markers = 0, shutdown = 0;
 	struct timeval	    tv, fb_before, fb_after, fx_before, fx_after;
+	struct timeval      x_before, x_after;
 	double		    now, rate, sleeptime;
 	int		    max_phase = sess->protocol >= 29 ? 2 : 1;
 
@@ -1027,13 +1233,37 @@ rsync_sender(struct sess *sess, int fdin,
 	memset(&sender, 0, sizeof(sender));
 	sender.append = sess->opts->append;
 	sender.phase = &metadata_phase;
+
+	/* Fields propagated from the parent role, if any */
+	if (sess->role != NULL) {
+		sender.role_fetch_outfmt = sess->role->role_fetch_outfmt;
+		sender.role_fetch_outfmt_cookie =
+		    sess->role->role_fetch_outfmt_cookie;
+	}
+
 	sess->role = &sender;
 
 	memset(&up, 0, sizeof(struct send_up));
 	TAILQ_INIT(&sdlq);
 	up.stat.fd = -1;
-	up.stat.map = MAP_FAILED;
+	up.stat.map = NULL;
 	up.stat.blktab = blkhash_alloc();
+
+	/*
+	 * Client sends zero-length exclusions if deleting, unless we're
+	 * deleting excluded files, too.
+	 */
+	if (!sess->opts->server && (sess->opts->prune_empty_dirs ||
+	    (sess->opts->del && (!sess->opts->del_excl || protocol_delrules))))
+		send_rules(sess, fdout);
+
+	/*
+	 * If we're the server, read our exclusion list.  We need to do this
+	 * early as some rules may hide files from the transfer.
+	 */
+
+	if (sess->opts->server)
+		recv_rules(sess, fdin);
 
 	/*
 	 * Fill in from --files-from, if given.
@@ -1064,22 +1294,6 @@ rsync_sender(struct sess *sess, int fdin,
 			sess->mplex_reads = 1;
 		}
 	}
-
-	/*
-	 * Client sends zero-length exclusions if deleting, unless we're
-	 * deleting excluded files, too.
-	 */
-	if (!sess->opts->server && sess->opts->del &&
-	    (!sess->opts->del_excl || protocol_delrules))
-		send_rules(sess, fdout);
-
-	/*
-	 * If we're the server, read our exclusion list.  We need to do this
-	 * early as some rules may hide files from the transfer.
-	 */
-
-	if (sess->opts->server)
-		recv_rules(sess, fdin);
 
 	/*
 	 * Generate the list of files we want to send from our
@@ -1126,12 +1340,19 @@ rsync_sender(struct sess *sess, int fdin,
 	} else if (!sess->opts->server)
 		LOG1("Transfer starting: %zu files", fl.sz);
 
+	sctx.sess = sess;
+	sctx.fl = &fl;
 	if (sess->opts->remove_source) {
-		sctx.sess = sess;
-		sctx.fl = &fl;
-
 		if (!io_register_handler(IT_SUCCESS, &file_success, &sctx)) {
 			ERRX("Failed to install remove-source-files handler; exiting");
+			rc = 1;
+			goto out;
+		}
+	}
+
+	if (sess->itemize) {
+		if (!io_register_handler(IT_DELETED, &file_deleted, &sctx)) {
+			ERRX("Failed to install delete handler; exiting");
 			rc = 1;
 			goto out;
 		}
@@ -1141,6 +1362,18 @@ rsync_sender(struct sess *sess, int fdin,
 	if (!iobuf_alloc(sess, &rbuf, sizeof(int32_t) * 5)) {
 		ERRX1("iobuf_alloc");
 		goto out;
+	}
+
+	gettimeofday(&x_before, NULL);
+
+	/*
+	 * If we're the server then arrange for log_vwritef() to append
+	 * all tagged log messages to the sender's output buffer.
+	 */
+	if (sess->opts->server) {
+		sess->wbufp = &wbuf;
+		sess->wbufszp = &wbufsz;
+		sess->wbufmaxp = &wbufmax;
 	}
 
 	/*
@@ -1159,7 +1392,7 @@ rsync_sender(struct sess *sess, int fdin,
 	for (;;) {
 #define	READ_AVAIL(pfd, iobuf) \
 	(((pfd)[0].revents & POLLIN) != 0 || iobuf_get_readsz((iobuf)) != 0)
-		assert(pfd[0].fd != -1);
+		assert(pfd[0].fd != -1 || iobuf_seen_eof(&rbuf));
 
 		if (iobuf_get_readsz(&rbuf) > 0) {
 			/*
@@ -1188,8 +1421,16 @@ rsync_sender(struct sess *sess, int fdin,
 				ERRX("poll: bad fd");
 				goto out;
 			} else if (pfd[i].revents & POLLHUP) {
-				ERRX("poll: hangup");
-				goto out;
+				/*
+				 * We still ignore POLLHUP on pfd[1] if we have
+				 * data still to process, because we may not
+				 * need to respond.
+				 */
+				if (i >= 2 || !READ_AVAIL(pfd, &rbuf)) {
+					ERRX("poll: hangup on sender idx %zd iobuf capacity %zu",
+					    i, iobuf_get_readsz(&rbuf));
+					goto out;
+				}
 			}
 
 		/*
@@ -1223,6 +1464,15 @@ rsync_sender(struct sess *sess, int fdin,
 			}
 
 			pfd[0].revents &= ~POLLIN;
+
+			/*
+			 * If the other side hung up, we can stop polling this
+			 * fd and mark the readbuf as finished.
+			 */
+			if ((pfd[0].revents & POLLHUP) != 0) {
+				pfd[0].fd = -1;
+				iobuf_eof(&rbuf);
+			}
 		}
 
 		/*
@@ -1244,7 +1494,7 @@ rsync_sender(struct sess *sess, int fdin,
 				 * pass these through.
 				 */
 			} else if (avail < flinfosz) {
-				continue;
+				goto check_other;
 			}
 
 			iobuf_read_int(&rbuf, &idx);
@@ -1283,34 +1533,30 @@ rsync_sender(struct sess *sess, int fdin,
 
 			if (idx == -1)
 				assert(mdl == NULL);
-
 		}
 
 		if (READ_AVAIL(pfd, &rbuf) && mdl != NULL) {
 			int bret;
 
-			switch (mdl->dlstate) {
-			case SDL_IFLAGS:
+			if (mdl->dlstate == SDL_IFLAGS) {
 				bret = sender_get_iflags(&rbuf, fl.flp, mdl);
 				if (bret < 0) {
 					ERRX1("sender_get_iflags");
 					return 0;
 				} else if (bret == 0) {
-					break;
+					goto check_other;
 				}
 
 				if ((fl.flp[mdl->idx].iflags & IFLAG_TRANSFER) == 0) {
-					mdl->dlstate = SDL_SKIP;
-					break;
+					mdl->dlstate = SDL_DONE;
 				} else if (sess->opts->dry_run == DRY_FULL) {
 					mdl->dlstate = SDL_DONE;
-					break;
+				} else {
+					mdl->dlstate = SDL_META;
 				}
+			}
 
-				mdl->dlstate = SDL_META;
-				/* FALLTHROUGH */
-			case SDL_META:
-			case SDL_BLOCKS:
+			if (mdl->dlstate == SDL_BLOCKS || mdl->dlstate == SDL_META) {
 				mdl->blks = blk_recv(sess, fdin, &rbuf,
 				    fl.flp[mdl->idx].path, mdl->blks,
 				    &mdl->blkidx, &mdl->dlstate);
@@ -1319,17 +1565,10 @@ rsync_sender(struct sess *sess, int fdin,
 					ERRX1("blk_recv");
 					return 0;
 				}
-
-				break;
-			default:
-				break;
 			}
 
 			if (mdl->dlstate == SDL_DONE) {
 				TAILQ_INSERT_TAIL(&sdlq, mdl, entries);
-				mdl = NULL;
-			} else if (mdl->dlstate == SDL_SKIP) {
-				free(mdl);
 				mdl = NULL;
 			}
 
@@ -1351,10 +1590,11 @@ rsync_sender(struct sess *sess, int fdin,
 		 * Here we also enable the poll event for output.
 		 */
 
+	  check_other:
 		if (pfd[2].revents & POLLIN) {
 			assert(up.cur != NULL);
 			assert(up.stat.fd != -1);
-			assert(up.stat.map == MAP_FAILED);
+			assert(up.stat.map == NULL);
 			assert(up.stat.mapsz == 0);
 			f = &fl.flp[up.cur->idx];
 
@@ -1371,13 +1611,10 @@ rsync_sender(struct sess *sess, int fdin,
 			 */
 
 			if ((up.stat.mapsz = st.st_size) > 0) {
-				up.stat.map = mmap(NULL,
-					up.stat.mapsz, PROT_READ,
-					MAP_SHARED, up.stat.fd, 0);
-				if (up.stat.map == MAP_FAILED) {
-					ERR("%s: mmap", f->path);
+				up.stat.map = fmap_open(f->path, up.stat.fd,
+				    st.st_size);
+				if (up.stat.map == NULL)
 					goto out;
-				}
 			}
 
 			pfd[2].fd = -1;
@@ -1435,27 +1672,36 @@ rsync_sender(struct sess *sess, int fdin,
 					rate = (double)sess->total_write /
 						(now - sess->start_time);
 					if (rate > sess->opts->bwlimit) {
-						sleeptime = 
+						sleeptime =
 							/* Time supposed to have expired */
 							sess->total_write / 
 							sess->opts->bwlimit
 							/* Time actually expired */
 							- (now - sess->start_time)
 							;
-						usleep(sleeptime * 1000 * 1000);
+						if (sleeptime > 0)
+							usleep(sleeptime * 1000 * 1000);
 					}
 				}
 			}
 		}
 
 		/*
-		 * Engage the FSM for the current transfer.
+		 * Engage the FSM for the current transfer.  If we're in the
+		 * BLKSTAT_PHASE state, then we won't need to write and it's
+		 * sufficient to enter the fsm with just data to read.
+		 *
 		 * If our phase changes, stop processing.
 		 */
 
-		if (pfd[1].revents & POLLOUT && up.cur != NULL) {
+		if (((up.stat.curst == BLKSTAT_PHASE && READ_AVAIL(pfd, &rbuf)) ||
+		    (pfd[1].revents & POLLOUT)) && up.cur != NULL) {
+			struct flist *curfl;
+			size_t curidx;
+
 			assert(pfd[2].fd == -1);
 			assert(wbufpos == 0 && wbufsz == 0);
+			curidx = up.cur->idx;
 			if (sess->opts->compress) {
 				res = send_up_fsm_compressed(sess, &phase, &up,
 				    &wbuf, &wbufsz, &wbufmax, fl.flp);
@@ -1463,6 +1709,15 @@ rsync_sender(struct sess *sess, int fdin,
 				res = send_up_fsm(sess, &phase, &up,
 				    &wbuf, &wbufsz, &wbufmax, fl.flp);
 			}
+
+			if (curidx != -1) {
+				curfl = &fl.flp[curidx];
+				rsync_progress(sess, curfl->st.size,
+				    up.stat.curpos,
+				    up.stat.curst == BLKSTAT_DONE, curidx,
+				    fl.sz);
+			}
+
 			if (!res) {
 				ERRX1("send_up_fsm");
 				goto out;
@@ -1479,12 +1734,24 @@ rsync_sender(struct sess *sess, int fdin,
 		 */
 
 		if (up.cur == NULL) {
-			struct flist *nextfl;
+			struct flist *f, *nextfl;
+			int oflags;
 
 			assert(pfd[2].fd == -1);
 			assert(up.stat.fd == -1);
-			assert(up.stat.map == MAP_FAILED);
+			assert(up.stat.map == NULL);
 			assert(up.stat.mapsz == 0);
+
+			/*
+			 * Wait until all pending output has been written before
+			 * starting on the next download request.  This prevents
+			 * the wbuf from growing without bound.
+			 */
+			if (wbufsz > 0) {
+				pfd[1].fd = fdout;
+				continue;
+			}
+
 			assert(wbufsz == 0 && wbufpos == 0);
 			pfd[1].fd = -1;
 
@@ -1514,6 +1781,45 @@ rsync_sender(struct sess *sess, int fdin,
 				continue;
 			}
 
+			sess->total_read_lf = sess->total_read;
+			sess->total_write_lf = sess->total_write;
+
+			f = &fl.flp[up.cur->idx];
+
+			if ((f->iflags & IFLAG_TRANSFER) == 0) {
+				bool hlink = (f->iflags & IFLAG_HLINK_FOLLOWS) != 0;
+				bool sig = (f->iflags & SIGNIFICANT_IFLAGS) != 0;
+				size_t pos = wbufsz;
+
+				send_iflags(sess, &wbuf, &wbufsz,
+					&wbufmax, &pos, fl.flp, up.cur->idx);
+
+				if (sig || hlink || sess->itemize) {
+					bool local = (f->iflags & IFLAG_LOCAL_CHANGE) != 0;
+					bool dir = S_ISDIR(f->st.mode);
+
+					if (local || dir || hlink || sess->itemize)
+						log_item(sess, f);
+				}
+
+				send_up_reset(&up);
+				pfd[1].fd = fdout;
+				continue;
+			}
+
+			/*
+			 * Room for improvement: --copy-links should really
+			 * cause us to record the path at the time of flist
+			 * generation and specifically send *that* file here,
+			 * rather than relying on the link dereferencing to the
+			 * same file twice.  At that point, we should be able
+			 * to pick O_NOFOLLOW back up unconditionally.
+			 */
+			oflags = O_RDONLY | O_NONBLOCK;
+			if (!sess->opts->copy_links &&
+			    !sess->opts->copy_unsafe_links)
+				oflags |= O_NOFOLLOW;
+
 			/*
 			 * Non-blocking open of file.
 			 * This will be picked up in the state machine
@@ -1526,10 +1832,9 @@ rsync_sender(struct sess *sess, int fdin,
 			nextfl = &fl.flp[up.cur->idx];
 			if (nextfl->open != NULL) {
 				up.stat.fd = (*nextfl->open)(sess, nextfl,
-				    O_RDONLY|O_NONBLOCK);
+				    oflags);
 			} else {
-				up.stat.fd = open(nextfl->path,
-				    O_RDONLY|O_NONBLOCK, 0);
+				up.stat.fd = open(nextfl->path, oflags, 0);
 			}
 			if (up.stat.fd == -1) {
 				char buf[PATH_MAX];
@@ -1537,17 +1842,34 @@ rsync_sender(struct sess *sess, int fdin,
 				ERR("%s: open (2) in %s",
 				    fl.flp[up.cur->idx].path,
 				    getcwd(buf, sizeof(buf)));
-				goto out;
+
+				sess->total_errors++;
+				send_up_reset(&up);
+				pfd[1].fd = fdout;
+				continue;
 			}
 			pfd[2].fd = up.stat.fd;
+
+			if (!sess->lateprint)
+				log_item(sess, f);
 		}
 	}
+
+	/*
+	 * At this point there shouldn't be any data remaining
+	 * in the sender's output buffer.
+	 */
+	assert(wbufsz == 0);
+	sess->wbufp = NULL;
 
 	if (!TAILQ_EMPTY(&sdlq)) {
 		ERRX("phases complete with files still queued");
 		goto out;
 	}
 
+	gettimeofday(&x_after, NULL);
+	timersub(&x_after, &x_before, &tv);
+	sess->xfer_time = (tv.tv_sec * 1000) + (tv.tv_usec / 1000);
 	if (!sess_stats_send(sess, fdout)) {
 		ERRX1("sess_stats_end");
 		goto out;
@@ -1559,7 +1881,7 @@ rsync_sender(struct sess *sess, int fdin,
 		goto out;
 	}
 
-	LOG2("sender finished updating");
+	LOG3("sender finished updating");
 	rc = 1;
 out:
 	send_up_reset(&up);
@@ -1572,6 +1894,19 @@ out:
 	free(wbuf);
 	blkhash_free(up.stat.blktab);
 	cleanup_filesfrom(sess);
+
+	/*
+	 * If we're the server and there was an error then try to flush
+	 * any data remaining in the output buffer as it likely contains
+	 * an error message.
+	 */
+	if (sess->wbufp != NULL) {
+		if (wbufsz > 0) {
+			assert(wbufsz > wbufpos);
+			write(fdout, wbuf + wbufpos, wbufsz - wbufpos);
+		}
+		sess->wbufp = NULL;
+	}
 
 	return rc;
 }
