@@ -373,6 +373,14 @@ struct	fldstat {
 	gid_t		 gid;	 /* group */
 };
 
+enum log_type {
+	LT_CLIENT,
+	LT_INFO,
+	LT_LOG,
+	LT_WARNING,
+	LT_ERROR,
+};
+
 enum name_basis {
 	BASIS_DIR_LOW = 0,
 	BASIS_DIR_HIGH = 0x7F,
@@ -392,6 +400,15 @@ enum name_basis {
 typedef int platform_open(const struct sess *, const struct flist *, int);
 typedef int platform_flist_sent(struct sess *, int, const struct flist *);
 
+struct	froot {
+	char		*rootpath;
+	int		 refcount;
+	int		 rootfd;	/* root dirfd */
+};
+
+struct froot *froot_acquire(struct froot *);
+void froot_release(struct froot *);
+
 struct	flist {
 	char		*path; /* path relative to root */
 	int		 pdfd; /* dirfd for partial */
@@ -399,14 +416,28 @@ struct	flist {
 	struct flstat	 st; /* file information */
 	char		*link; /* symlink target, hlink name, or NULL */
 	unsigned char    md[MD4_DIGEST_LENGTH]; /* MD4 hash for --checksum */
-	int		 flstate; /* flagged for redo, or complete? */
 	int32_t		 iflags; /* Itemize flags */
 	enum name_basis	 basis; /* name basis */
-	int		 sendidx; /* Sender index */
-	platform_open	*open; /* special open() for this entry */
-	platform_flist_sent	*sent; /* notify the platform an entry was sent */
-	struct fldstat	 dstat; /* original destination file information */
+	enum fmode	 fmode; /* Sender/receiver */
+	union {
+		struct {
+			struct froot	*froot;
+			platform_open	*open; /* special open() for this entry */
+			platform_flist_sent	*sent; /* notify the platform an entry was sent */
+		};	/* Sender state, not available in the receiver */
+		struct {
+			struct fldstat	 dstat; /* original destination file information */
+			int	 flstate; /* flagged for redo, or complete? */
+			int	 sendidx; /* Sender index */
+		};	/* Receiver state, not available in the sender */
+	};
 };
+
+/*
+ * Allocate the file list in chunk sizes of 8MiB's worth of items
+ * to reduce thrashing the memory allocator and improve performance.
+ */
+#define	FLIST_CHUNK_SIZE	((8 << 20) / sizeof(struct flist))
 
 #define	FLIST_COMPLETE		0x01	/* Finished */
 #define	FLIST_REDO		0x02	/* Finished, but go again */
@@ -415,7 +446,7 @@ struct	flist {
 #define	FLIST_SUCCESS_ACKED	0x10	/* Sent success message */
 #define	FLIST_NEED_HLINK	0x20	/* Needs to be hardlinked */
 #define	FLIST_SKIPPED		0x40	/* File should be skipped */
-
+#define	FLIST_SKIP_METADATA	0x80	/* File metadata should be skipped */
 #define	FLIST_DONE_MASK		(FLIST_SUCCESS | FLIST_REDO | FLIST_FAILED)
 
 /*
@@ -425,8 +456,9 @@ struct fl {
 	struct flist *flp;
 	size_t sz;   /* Actual entries */
 	size_t max;  /* Allocated size */
+	struct sess *sess;	/* Associated session */
 };
-void fl_init(struct fl *);
+void fl_init(struct sess *, struct fl *);
 long fl_new_index(struct fl *); /* Returns index of new element */
 struct flist *fl_new(struct fl *); /* Returns pointer to new element */
 struct flist *fl_atindex(struct fl *, size_t idx);
@@ -509,6 +541,8 @@ struct	opts {
 	long		 block_size;		/* --block-size */
 	char            *filesfrom_host;        /* --files-from */
 	char            *filesfrom_path;        /* --files-from */
+	char		*logfile;		/* --log-file */
+	char		*logformat;		/* --log-file-format */
 	int		 whole_file;		/* --whole-file */
 	const char	*read_batch;		/* --read-batch */
 	const char	*write_batch;		/* --write-batch */
@@ -525,7 +559,6 @@ struct	opts {
 	int		 preserve_executability;	/* --executability */
 	int		 modwin;		/* --modify-windows=sec */
 	int		 fuzzy_basis;		/* -y */
-	int		 quiet;			/* -q, --quiet */
 	long		 max_delete;		/* --max-delete */
 #ifdef __APPLE__
 	int		 extended_attributes;	/* --extended-attributes */
@@ -620,6 +653,7 @@ typedef const char *(role_fetch_outfmt_fn)(const struct sess *, void *, char);
  */
 struct	role {
 	int		 append;		/* Append mode active */
+	int		 client;		/* Socket for the client */
 
 	/* Propagated between successive roles */
 	role_fetch_outfmt_fn	*role_fetch_outfmt;	/* --out-format field */
@@ -686,6 +720,8 @@ struct	sess {
 	uint8_t		   itemize; /* %i + %I in --out-format */
 	uint8_t		   itemize_i; /* %i in --out-format */
 	uint8_t		   itemize_o; /* %o in --out-format */
+	uint8_t		   logfile_itemize_i; /* %i in --log-file-format */
+	uint8_t		   logfile_itemize_o; /* %o in --log-file-format */
 	uint8_t		   lateprint; /* Does output format contain a flag requiring late print? */
 	char             **filesfrom; /* Contents of files-from */
 	size_t             filesfrom_n; /* Number of lines for filesfrom */
@@ -749,6 +785,7 @@ struct hardlinks;
 
 extern const char rsync_shopts[];
 extern const struct option rsync_lopts[];
+extern int quiet;
 extern int verbose;
 
 #define	TMPDIR_FD	(sess->opts->temp_dir && p->tempfd != -1 ? p->tempfd : p->rootfd)
@@ -912,6 +949,7 @@ int	 cfg_param_str(struct daemon_cfg *, const char *, const char *,
 	    const char **);
 int	 cfg_has_param(struct daemon_cfg *, const char *, const char *);
 
+void	fl_init(struct sess *, struct fl *);
 int	flist_dir_cmp(const void *, const void *);
 int	flist_fts_check(struct sess *, FTSENT *, enum fmode);
 int	flist_del(struct sess *, int, const struct flist *, size_t);
@@ -1008,6 +1046,8 @@ int	io_read_ulong(struct sess *, int, uint64_t *);
 int	io_read_vstring(struct sess *, int, char **);
 int	io_write_buf_tagged(struct sess *, int, const void *, size_t,
 	    enum iotag);
+int	io_write_buf_tagged_safe(struct sess *, int, const void *, size_t,
+	    enum iotag);
 int	io_write_buf(struct sess *, int, const void *, size_t);
 int	io_write_byte(struct sess *, int, uint8_t);
 int	io_write_int_tagged(struct sess *, int, int32_t, enum iotag);
@@ -1024,6 +1064,8 @@ int	io_write_blocking(int fd, const void *buf, size_t sz);
 int	io_data_written(struct sess *, int, const void *, size_t);
 
 int	io_lowbuffer_alloc(struct sess *, void **, size_t *, size_t *, size_t);
+int	io_lowbuffer_alloc_safe(struct sess *, void **, size_t *, size_t *,
+	    size_t);
 void	io_lowbuffer_int(struct sess *, void *, size_t *, size_t, int32_t);
 void	io_lowbuffer_short(struct sess *, void *, size_t *, size_t, int32_t);
 void	io_lowbuffer_buf(struct sess *, void *, size_t *, size_t, const void *,
@@ -1149,7 +1191,7 @@ int		 hash_file_by_path(int, const char *, size_t, unsigned char *);
  * generic move_file() that should handle things well enough for the majority of
  * platforms.
  */
-int		 move_file(int, const char *, int, const char *, int);
+int		 move_file(int, const char *, int, const char *, int, int);
 void		 copy_file(int, const char *, const struct flist *);
 int		 backup_file(int, const char *, int, const char *, int, const struct fldstat *);
 int		 backup_to_dir(struct sess *, int, const struct flist *,
@@ -1174,7 +1216,7 @@ int		 platform_flist_entry_received(struct sess *, int,
 		    struct flist *);
 void		 platform_flist_received(struct sess *, struct flist *, size_t);
 int		 platform_move_file(const struct sess *, struct flist *,
-		    int, const char *, int, const char *, int);
+		    int, const char *, int, const char *, int, int);
 int		 platform_finish_transfer(const struct sess *, struct flist *,
 		    int, const char *);
 
@@ -1237,8 +1279,17 @@ void log_format_init(struct sess *sess);
 void our_strmode(mode_t mode, char *p);
 int print_7_or_8_bit(const struct sess *sess, const char *fmt, const char *s,
     struct sbuf *);
-int log_item_impl(struct sess *sess, const struct flist *f);
+int log_item_impl(enum log_type, struct sess *sess, const struct flist *f);
 int log_item(struct sess *sess, const struct flist *f);
 const char *iflags_decode(uint32_t iflags);
+
+static inline enum log_type
+xfer_log_level(struct sess *sess)
+{
+
+	if (sess->lateprint && !sess->opts->server && !sess->opts->daemon)
+		return (LT_INFO);
+	return (LT_LOG);
+}
 
 #endif /*!EXTERN_H*/

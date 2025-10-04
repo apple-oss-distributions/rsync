@@ -310,11 +310,82 @@ findme ()
     (
         cd "$1" ; shift
 	if [ ${dirs} -ne 0 ] ; then
-            find "$@" -type d -exec stat -f "$stat_fmt" {} \; | sort
+            find "$@" -type d -print0 | xargs -0 stat -f "$stat_fmt" | sort
         else
-            find "$@" ! -type d -exec stat -f "$stat_fmt %z" {} \; | sort
+            find "$@" ! -type d -print0 | xargs -0 stat -f "$stat_fmt %z" | sort
         fi
     )
+}
+
+xattr_capable ()
+{
+
+    if which lsextattr 1>/dev/null 2>&1; then
+        echo "lsextattr"
+        return 0
+    elif which getfattr 1>/dev/null 2>&1; then
+        echo "getfattr"
+        return 0
+    elif which xattr 1>/dev/null 2>&1; then
+        echo "xattr"
+        return 0
+    fi
+
+    return 1
+}
+
+xattr_set ()
+{
+    file=$1
+    name=$2
+    value=$3
+
+    xattr_tool=$(xattr_capable)
+    if [ $? -ne 0 ]; then
+        # The caller should have checked that xattrs are supported.
+        return 1
+    fi
+
+    case "$xattr_tool" in
+        lsextattr)
+            setextattr -h user "$name" "$value" "$file"
+            ;;
+        getfattr)
+            setfattr -hn "$name" -v "$value" "$file"
+            ;;
+        xattr)
+            xattr -ws "$name" "$value" "$file"
+            ;;
+    esac
+}
+
+xattr_dump_cmd ()
+{
+    xattr_tool=$(xattr_capable)
+    if [ $? -ne 0 ]; then
+        # This one will be called unconditionally, so we want to just succeed if
+        # we don't have xattr support.
+        echo 'true'
+        return 0
+    fi
+
+    case "$xattr_tool" in
+        lsextattr)
+            echo 'lsextattr -hq user '
+            ;;
+        getfattr)
+            echo 'getfattr -hd '
+            ;;
+        xattr)
+            echo 'xattr -s '
+            ;;
+    esac
+}
+
+xattr_dump ()
+{
+
+    $(xattr_dump_cmd) "$1"
 }
 
 # compare two trees.  This will later be modular to pick between:
@@ -351,4 +422,30 @@ compare_trees ()
 
     # file contents
     diff -ru "$1" "$2" 1>&2
+
+    # Check to see if find supports -xattr:
+    #
+    if ! find . -depth 0 -xattr ; then
+        continue
+    fi
+
+    # Check for any xattrs; note that this won't do the right thing if we have
+    # files that both have xattrs and newlines in the filename.  This is a known
+    # limitation that seems like an OK compromise.
+    #
+    xdc="$(xattr_dump_cmd)"
+
+    find -H "$1" -xattr -print0 | xargs -0 ${xdc} > find1x
+    sed -E -i.orig -e "s%^$1%dirx%" find1x
+
+    find -H "$2" -xattr -print0 | xargs -0 ${xdc} > find2x
+    sed -E -i.orig -e "s%^$2%dirx%" find2x
+
+    diff -u find[12]x 1>&2
+}
+
+mksock()
+{
+
+	command $tstdir/mksock "$@"
 }

@@ -533,8 +533,7 @@ send_up_fsm_compressed(struct sess *sess, size_t *phase,
 		sess->total_files_xfer++;
 		sess->total_xfer_size += fl[up->cur->idx].st.size;
 
-		if (sess->lateprint)
-			log_item(sess, &fl[up->cur->idx]);
+		log_item_impl(xfer_log_level(sess), sess, &fl[up->cur->idx]);
 
 		send_up_reset(up);
 		return 1;
@@ -743,8 +742,7 @@ send_up_fsm(struct sess *sess, size_t *phase,
 		sess->total_files_xfer++;
 		sess->total_xfer_size += fl[up->cur->idx].st.size;
 
-		if (sess->lateprint)
-			log_item(sess, &fl[up->cur->idx]);
+		log_item_impl(xfer_log_level(sess), sess, &fl[up->cur->idx]);
 
 		send_up_reset(up);
 		return 1;
@@ -1037,6 +1035,7 @@ static int
 file_success(void *cookie, const void *data, size_t datasz)
 {
 	struct success_ctx *sctx = cookie;
+	struct opts *opts;
 	size_t pos = 0;
 	int32_t idx;
 
@@ -1051,7 +1050,8 @@ file_success(void *cookie, const void *data, size_t datasz)
 		return 0;
 	}
 
-	if (sctx->sess->opts->remove_source) {
+	opts = sctx->sess->opts;
+	if (opts->remove_source) {
 		struct flist *fl;
 		struct stat sb;
 
@@ -1067,7 +1067,7 @@ file_success(void *cookie, const void *data, size_t datasz)
 			return 1;
 		}
 
-		if (unlink(fl->path) == -1)
+		if (!opts->dry_run && unlink(fl->path) == -1)
 			ERR("%s: unlink", fl->path);
 	}
 
@@ -1223,7 +1223,7 @@ rsync_sender(struct sess *sess, int fdin,
 	if (protocol_itemize)
 		flinfosz += sizeof(int16_t);
 
-	fl_init(&fl);
+	fl_init(sess, &fl);
 	flg = &fl;
 	if (pledge("stdio getpw rpath", NULL) == -1) {
 		ERR("pledge");
@@ -1241,6 +1241,10 @@ rsync_sender(struct sess *sess, int fdin,
 		    sess->role->role_fetch_outfmt_cookie;
 	}
 
+	if (sess->opts->server)
+		sender.client = fdout;
+	else
+		sender.client = -1;
 	sess->role = &sender;
 
 	memset(&up, 0, sizeof(struct send_up));
@@ -1306,6 +1310,8 @@ rsync_sender(struct sess *sess, int fdin,
 		ERRX1("flist_gen");
 		goto out;
 	}
+	assert(fl.flp != NULL || fl.sz == 0);
+
 	gettimeofday(&fb_after, NULL);
 	timersub(&fb_after, &fb_before, &tv);
 	sess->flist_build = (tv.tv_sec * 1000) + (tv.tv_usec / 1000);
@@ -1735,7 +1741,8 @@ rsync_sender(struct sess *sess, int fdin,
 
 		if (up.cur == NULL) {
 			struct flist *f, *nextfl;
-			int oflags;
+			const char *opath;
+			int dirfd, nlinkflag, oflags;
 
 			assert(pfd[2].fd == -1);
 			assert(up.stat.fd == -1);
@@ -1787,38 +1794,16 @@ rsync_sender(struct sess *sess, int fdin,
 			f = &fl.flp[up.cur->idx];
 
 			if ((f->iflags & IFLAG_TRANSFER) == 0) {
-				bool hlink = (f->iflags & IFLAG_HLINK_FOLLOWS) != 0;
-				bool sig = (f->iflags & SIGNIFICANT_IFLAGS) != 0;
 				size_t pos = wbufsz;
 
 				send_iflags(sess, &wbuf, &wbufsz,
 					&wbufmax, &pos, fl.flp, up.cur->idx);
 
-				if (sig || hlink || sess->itemize) {
-					bool local = (f->iflags & IFLAG_LOCAL_CHANGE) != 0;
-					bool dir = S_ISDIR(f->st.mode);
-
-					if (local || dir || hlink || sess->itemize)
-						log_item(sess, f);
-				}
-
+				log_item(sess, f);
 				send_up_reset(&up);
 				pfd[1].fd = fdout;
 				continue;
 			}
-
-			/*
-			 * Room for improvement: --copy-links should really
-			 * cause us to record the path at the time of flist
-			 * generation and specifically send *that* file here,
-			 * rather than relying on the link dereferencing to the
-			 * same file twice.  At that point, we should be able
-			 * to pick O_NOFOLLOW back up unconditionally.
-			 */
-			oflags = O_RDONLY | O_NONBLOCK;
-			if (!sess->opts->copy_links &&
-			    !sess->opts->copy_unsafe_links)
-				oflags |= O_NOFOLLOW;
 
 			/*
 			 * Non-blocking open of file.
@@ -1830,12 +1815,78 @@ rsync_sender(struct sess *sess, int fdin,
 			 * flist-specified open if provided.
 			 */
 			nextfl = &fl.flp[up.cur->idx];
+			nlinkflag = 0;
+			oflags = O_RDONLY | O_NONBLOCK;
+			if (nextfl->froot != NULL) {
+				const char *rootp = nextfl->froot->rootpath;
+				size_t rootplen;
+
+				dirfd = nextfl->froot->rootfd;
+				opath = nextfl->path;
+
+				rootplen = strlen(rootp);
+				assert(rootplen > 0);
+
+				/*
+				 * Normalize the root part to exclude the
+				 * final delimiter, then we'll consistently
+				 * ensure that the root matches along with a
+				 * delimiter just following that.
+				 */
+				if (rootp[rootplen - 1] == '/')
+					rootplen--;
+				if (strncmp(opath, rootp, rootplen) == 0 &&
+				    opath[rootplen] == '/')
+					opath += rootplen;
+
+				while (opath[0] == '/' && opath[0] != '\0')
+					opath++;
+
+				assert(opath[0] != '\0');
+
+				/*
+				 * We relax a little bit from O_NOFOLLOW if we
+				 * have a dirfd because the damage that can be
+				 * caused from a confused entry is a lot more
+				 * limited if we restrict resolution to within
+				 * the dirfd.
+				 */
+				nlinkflag = O_RESOLVE_BENEATH;
+			} else {
+				dirfd = AT_FDCWD;
+				opath = nextfl->path;
+				nlinkflag = O_NOFOLLOW;
+			}
+
+			/*
+			 * Room for improvement: --copy-links should really
+			 * cause us to record the path at the time of flist
+			 * generation and specifically send *that* file here,
+			 * rather than relying on the link dereferencing to the
+			 * same file twice.  At that point, we should be able
+			 * to pick O_NOFOLLOW back up unconditionally.
+			 */
+			if (!sess->opts->copy_links &&
+			    !sess->opts->copy_unsafe_links &&
+			    !sess->opts->copy_dirlinks)
+				oflags |= nlinkflag;
+
 			if (nextfl->open != NULL) {
 				up.stat.fd = (*nextfl->open)(sess, nextfl,
 				    oflags);
 			} else {
-				up.stat.fd = open(nextfl->path, oflags, 0);
+				up.stat.fd = openat(dirfd, opath, oflags, 0);
 			}
+
+			if (nextfl->froot != NULL) {
+				int serrno = errno;
+
+				froot_release(nextfl->froot);
+				nextfl->froot = NULL;
+
+				errno = serrno;
+			}
+
 			if (up.stat.fd == -1) {
 				char buf[PATH_MAX];
 
@@ -1851,7 +1902,7 @@ rsync_sender(struct sess *sess, int fdin,
 			pfd[2].fd = up.stat.fd;
 
 			if (!sess->lateprint)
-				log_item(sess, f);
+				log_item_impl(LT_CLIENT, sess, f);
 		}
 	}
 
