@@ -55,8 +55,8 @@ extern struct cleanup_ctx *cleanup_ctx;
 
 int quiet;
 int verbose;
-#ifdef __APPLE__
 int syslog_trace;
+#ifdef __APPLE__
 os_log_t syslog_trace_obj;
 #endif
 int poll_contimeout;
@@ -277,6 +277,8 @@ fargs_parse(size_t argc, char *argv[], struct opts *opts)
 		sinkarg = argc - 1;
 		f->sourcesz = 0;
 	} else {
+		if (argc == 1)
+			opts->list_only = 2;
 		sinkarg = argc;
 		f->sourcesz = 1;
 	}
@@ -1801,19 +1803,25 @@ basedir:
 
 		/* XXX Samba rsync would normalize this path a little better. */
 		partial_dir = opts.partial_dir;
-		if (partial_dir[0] == '\0' || strcmp(partial_dir, ".") == 0) {
-			free(opts.partial_dir);
-			opts.partial_dir = NULL;
-		} else {
+		if (partial_dir[0] != '\0') {
 			char *endp;
 
 			endp = &partial_dir[strlen(partial_dir) - 1];
 			while (endp > partial_dir && *(endp - 1) == '/') {
 				*endp-- = '\0';
 			}
+		}
 
-			if (partial_dir[0] != '/' &&
-			    parse_rule(partial_dir, RULE_EXCLUDE, 0) == -1) {
+		/*
+		 * If it's empty or cwd after normalization, we don't need to
+		 * keep it around.  Otherwise, we add an exclusion rule if it
+		 * isn't an absolute path.
+		 */
+		if (partial_dir[0] == '\0' || strcmp(partial_dir, ".") == 0) {
+			free(opts.partial_dir);
+			opts.partial_dir = NULL;
+		} else if (partial_dir[0] != '/') {
+			if (parse_rule(partial_dir, RULE_EXCLUDE, 0) == -1) {
 				errx(ERR_SYNTAX, "syntax error in exclude: %s",
 				    partial_dir);
 			}
@@ -2131,7 +2139,13 @@ main(int argc, char *argv[])
 		err(ERR_IPC, "fork");
 	case 0:
 		close(fds[0]);
-#ifndef __APPLE__
+#ifdef __APPLE__
+		/*
+		 * Force --syslog-trace off in the post-fork child, because we
+		 * can't use os_log(3) in this context.
+		 */
+		syslog_trace = 0;
+#else
 		if (pledge("stdio exec", NULL) == -1)
 			err(ERR_IPC, "pledge");
 #endif
@@ -2183,7 +2197,7 @@ main(int argc, char *argv[])
 		/* Implied --list-only */
 		if (fargs->sink == NULL) {
 			assert(fargs->mode == FARGS_RECEIVER);
-			opts.list_only = 1;
+			assert(opts.list_only != 0);
 			fargs->sink = strdup(".");
 			if (fargs->sink == NULL)
 				errx(ERR_NOMEM, NULL);
